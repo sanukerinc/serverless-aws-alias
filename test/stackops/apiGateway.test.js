@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Unit tests for SNS events.
+ * Unit tests for API Gateway resources.
  */
 
 const { getInstalledPathSync } = require('get-installed-path');
@@ -28,7 +28,7 @@ describe('API Gateway', () => {
 	let logStub;
 
 	before(() => {
-		sandbox = sinon.sandbox.create();
+		sandbox = sinon.createSandbox();
 	});
 
 	beforeEach(() => {
@@ -608,8 +608,17 @@ describe('API Gateway', () => {
 	describe('#aliasHandleApiGateway()', () => {
 		it('should succeed with standard template', () => {
 			serverless.service.provider.compiledCloudFormationTemplate = require('../data/sls-stack-1.json');
-			serverless.service.provider.compiledCloudFormationAliasTemplate = require('../data/alias-stack-1.json');
-			return expect(awsAlias.aliasHandleApiGateway({}, [], {})).to.be.fulfilled;
+			const compiledAliasTemplate = require('../data/alias-stack-1.json');
+			serverless.service.provider.compiledCloudFormationAliasTemplate = compiledAliasTemplate;
+			return expect(awsAlias.aliasHandleApiGateway({}, [], {})).to.be.fulfilled
+				.then(() => BbPromise.all([
+					expect(compiledAliasTemplate)
+						.to.have.a.nested.property('Resources.Testfct1LambdaPermissionApiGateway.Properties.FunctionName')
+						.that.deep.equals({ Ref: 'Testfct1Alias' }),
+					expect(compiledAliasTemplate)
+						.to.have.a.nested.property('Resources.Testfct1WithSuffixLambdaPermissionApiGateway.Properties.FunctionName')
+						.that.deep.equals({ Ref: 'Testfct1WithSuffixAlias' }),
+				]));
 		});
 
 		describe('authorizer transform', () => {
@@ -622,6 +631,27 @@ describe('API Gateway', () => {
 			});
 
 			it('should handle only Lambda authorizers', () => {
+				const authorizeUriTemplate = {
+					"Fn::Join": [
+						"",
+						[
+							"arn:aws:apigateway:",
+							{
+								"Ref": "AWS::Region"
+							},
+							":lambda:path/2015-03-31/functions/",
+							{
+								"Fn::GetAtt": [
+									"TestauthLambdaFunction",
+									"Arn"
+								]
+							},
+							":${stageVariables.SERVERLESS_ALIAS}",
+							"/invocations"
+						]
+					]
+				};
+
 				const template = serverless.service.provider.compiledCloudFormationTemplate = stackTemplate;
 				const cogAuth = _.cloneDeep(template.Resources.CognitoTestApiGatewayAuthorizer);
 				cogAuth.Properties.Name += "-myAlias";
@@ -629,30 +659,107 @@ describe('API Gateway', () => {
 				return expect(awsAlias.aliasHandleApiGateway({}, [], {})).to.be.fulfilled
 				.then(() => BbPromise.all([
 					expect(template).to.not.have.a.nested.property('Resources.TestauthApiGatewayAuthorizer'),
+					expect(template).to.not.have.a.nested.property('Resources.TestauthApiGatewayRequestAuthorizer'),
 					expect(template).to.have.a.nested.property('Resources.TestauthApiGatewayAuthorizermyAlias')
 						.that.has.a.nested.property("Properties.AuthorizerUri")
-						.that.deep.equals({
-							"Fn::Join": [
-								"",
-								[
-									"arn:aws:apigateway:",
-									{
-										"Ref": "AWS::Region"
-									},
-									":lambda:path/2015-03-31/functions/",
-									{
-										"Fn::GetAtt": [
-											"TestauthLambdaFunction",
-											"Arn"
-										]
-									},
-									":${stageVariables.SERVERLESS_ALIAS}",
-									"/invocations"
-								]
-							]
-						}),
+						.that.deep.equals(authorizeUriTemplate),
+					expect(template).to.have.a.nested.property('Resources.TestauthApiGatewayRequestAuthorizermyAlias')
+						.that.has.a.nested.property("Properties.AuthorizerUri")
+						.that.deep.equals(authorizeUriTemplate),
 					expect(template).to.have.a.nested.property('Resources.CognitoTestApiGatewayAuthorizermyAlias')
 						.that.deep.equals(cogAuth)
+				]));
+			});
+
+			it('should support externally referenced custom authorizers', () => {
+				stackTemplate = _.cloneDeep(require('../data/auth-stack-2.json'));
+				const template = serverless.service.provider.compiledCloudFormationTemplate = stackTemplate;
+				const compiledAliasTemplate = serverless.service.provider.compiledCloudFormationAliasTemplate = aliasTemplate;
+				return expect(awsAlias.aliasHandleApiGateway({}, [], {})).to.be.fulfilled
+				.then(() => BbPromise.all([
+					expect(template)
+						.to.have.a.nested.property("Resources.ApiGatewayMethodFunc1Get.Properties.AuthorizerId")
+							.that.deep.equals({ Ref: "TestauthApiGatewayAuthorizermyAlias" }),
+					expect(template)
+						.to.have.a.nested.property("Resources.ApiGatewayMethodFunc1Get.DependsOn")
+							.that.equals("TestauthApiGatewayAuthorizermyAlias"),
+					expect(template)
+						.to.have.a.nested.property('Resources.TestauthApiGatewayAuthorizermyAlias.Properties.AuthorizerUri')
+							.that.deep.equals({
+								"Fn::Join": [
+									"",
+									[
+										"arn:aws:apigateway:",
+										{
+											"Ref": "AWS::Region"
+										},
+										":lambda:path/2015-03-31/functions/",
+										"arn:aws:lambda:us-east-1:",
+										{
+											"Ref": "AWS::AccountId"
+										},
+										":function:custom-auth",
+										"/invocations"
+									]
+								]}),
+					expect(compiledAliasTemplate)
+						.to.have.a.nested.property('Resources.TestauthLambdaPermissionApiGateway.DependsOn')
+							.that.is.empty
+				]));
+			});
+
+			it('should support externally referenced custom authorizers with Pseudo Parameters', () => {
+				stackTemplate = _.cloneDeep(require('../data/auth-stack-2.json'));
+				const template = serverless.service.provider.compiledCloudFormationTemplate = stackTemplate;
+				serverless.service.provider.compiledCloudFormationAliasTemplate = aliasTemplate;
+				return expect(awsAlias.aliasHandleApiGateway({}, [], {})).to.be.fulfilled
+				.then(() => BbPromise.all([
+					expect(template)
+						.to.have.a.nested.property("Resources.ApiGatewayMethodFunc2Get.Properties.AuthorizerId")
+							.that.deep.equals({ Ref: "PseudoParamCustomAuthApiGatewayAuthorizermyAlias" }),
+					expect(template)
+						.to.have.a.nested.property("Resources.ApiGatewayMethodFunc2Get.DependsOn")
+							.that.equals("PseudoParamCustomAuthApiGatewayAuthorizermyAlias"),
+					expect(template)
+					.to.have.a.nested.property('Resources.PseudoParamCustomAuthApiGatewayAuthorizermyAlias.Properties.AuthorizerUri')
+							.that.deep.equals({
+								"Fn::Join": [
+									"",
+									[
+										"arn:aws:apigateway:",
+										{
+											"Ref": "AWS::Region"
+										},
+										":lambda:path/2015-03-31/functions/",
+										{
+											"Fn::Sub": "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:custom-auth"
+										},
+										"/invocations"
+									]
+								]}),
+				]));
+
+			});
+
+			it('should move base mappings to alias stack', () => {
+				stackTemplate = _.cloneDeep(require('../data/auth-stack-2.json'));
+				const template = serverless.service.provider.compiledCloudFormationTemplate = stackTemplate;
+				serverless.service.provider.compiledCloudFormationAliasTemplate = aliasTemplate;
+				return expect(awsAlias.aliasHandleApiGateway({}, [], {})).to.be.fulfilled
+				.then(()=> BbPromise.all([
+					expect(template)
+						.to.not.have.a.nested.property('Resources.pathmapping'),
+					expect(aliasTemplate)
+						.to.have.a.nested.property('Resources.pathmapping')
+							.that.deep.equals({
+								Type: 'AWS::ApiGateway::BasePathMapping',
+								Properties: {
+									BasePath: '(none)',
+									DomainName: 'example.com',
+									RestApiId: { 'Fn::ImportValue': 'testService-myStage-ApiGatewayRestApi' },
+									Stage: { Ref: 'ApiGatewayStage' }
+								}
+							})
 				]));
 			});
 
@@ -704,7 +811,6 @@ describe('API Gateway', () => {
 					expect(serverless).to.not.have.a.nested.property('service.resources.Resources.TestauthApiGatewayAuthorizer'),
 				]));
 			});
-
 		});
 	});
 });
